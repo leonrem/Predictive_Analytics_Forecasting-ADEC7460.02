@@ -1,0 +1,199 @@
+---
+title: "COVID Cases"
+author: "Leonid Rempel"
+date: "05/08/2021"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    toc_float: yes
+    fig_width: 9
+    code_folding: hide
+---
+
+```{r Libraries, include = F}
+library(tidyverse)
+library(fpp2)
+library(ggthemes)
+library(lubridate)
+
+theme_set(theme_clean())
+```
+
+## Introduction
+
+For this homework assignment, I will be forecasting the change in the number of positive COVID-19 cases in the US over all the time available. I originally wanted to look at vaccination rates (I will be receiving my second Pfizer dose on 05/09) but there has not been enough weeks since the beginning of the vaccination roll-out. Furthermore the daily data is not as interesting to forecast, it follows a smooth trend. The daily number of people fully vaccinated  is taken from [covid tracking](https://covidtracking.com/data/download).
+
+```{r}
+df <- read.csv("national-history.csv")
+```
+
+We have 420 days of information, lets go ahead and make it into a weekly time series and plot it.
+
+```{r}
+weekly <- as.Date(cut(as.Date(df$date), "week"))
+df <- aggregate(positiveIncrease ~ weekly, df, sum)
+
+cases <- ts(df$positive, 
+         start = decimal_date(as.Date('2020-01-13')),
+         frequency = 52)
+```
+
+When we aggregate based on the week we have 60 cases.
+
+```{r}
+autoplot(cases/1e5) +
+  labs(title = 'New Cases',
+       y = 'Hundred Thousand Cases',
+       x = 'Time')
+```
+
+We seem to have a very smooth series, so something like exponential smoothing should do well, but lets look at the ACF and PACF breakdown first before fitting models.
+
+```{r}
+ggtsdisplay(cases)
+```
+
+
+We can see that we will need at least one lag, and that there is probably a longer term sinusoidal ACF pattern. 
+
+Lets see what a BoxCox transformation would look like for the data.
+
+```{r}
+BoxCox.lambda(cases)
+autoplot(BoxCox(cases, BoxCox.lambda(cases)),
+         main = 'BoxCox Transformed Cases',
+         ylab = 'Hundred Thousand Cases')
+```
+
+The Box Cox doesnt seem to make much of a difference.
+
+I will use `tsCV()` to compare models based on RMSE instead of doing a single train test split. 
+
+## ETS Fit
+
+First lets see what kind of model an ETS would fit the data. We know that it will definitely have a trend component and likely an exponential smoothing component.
+
+```{r}
+ets.fit <- ets(cases/1e5)
+autoplot(forecast(ets.fit, h = 8), ylab = 'Hundred Thousand Cases')
+```
+
+We can see that R chose an ETS model with a Additive errors and an Additive trend. Obviously we cannot have negative cases, but I will keep the cases that are around 1 and 0 from the start of 2020. Now lets record the results from the `tsCV()`
+
+```{r}
+ets.cv <- function(x, h) {
+  forecast(ets(x, model = "AAN"), h=h)
+}
+mean(na.omit(tsCV(cases/1e5, ets.cv, h = 8)))**0.5
+```
+
+## Arima Fit
+
+Because the frequency is daily, I cannot use an ARIMA model so I will use a fourier fit to forecast. First I want to get the best fourier fit and then I will plot it.
+
+```{r message=F}
+bestK <- 0
+bestfit <- list(aicc=Inf)
+for(i in 1:25) {
+  fit <- auto.arima(cases/1e5, xreg=fourier(cases/1e5, K=i))
+  if(fit$aicc < bestfit$aicc) {
+    bestfit <- fit
+    bestK <- i
+  }
+  else break;
+}
+```
+
+```{r}
+bestK
+bestfit
+```
+
+We only need 2 fourier terms to aid our ARIMA model. 
+
+``` {r}
+autoplot(forecast(bestfit, xreg = fourier(cases, K=bestK, h = 8)),
+         ylab = 'Hundreds Thousand Cases')
+```
+
+We have a deeper curve with the Fourier plus ARIMA error forecasts, lets see how its `tsCV()` compares with the `ets()` model.
+
+```{r}
+arima.cv <- function(x, h) {
+  forecast(auto.arima(x, xreg = fourier(x, K=2)), h=h)
+}
+mean(na.omit(tsCV(cases/1e5, arima.cv, h = 8)))**0.5
+```
+
+It performs worse than the `ets()` so we will stick to the `ets()` as we move on to our last model.
+
+## Neural Net
+
+The last model I wanted to explore was a neural net. First we fit a neural net model.
+
+```{r}
+neural.fit <- nnetar(cases/1e5)
+neural.fit
+```
+
+We have some information about the different weights placed on the different components of our time series. 
+
+```{r}
+autoplot(forecast(neural.fit, h = 8),
+         ylab = 'Hundreds Thousand Cases')
+```
+
+The neural net thinks that the forecasts will decrease. Lets see how the model performs on the `tsCV()`.
+
+```{r}
+nnet.cv <- function(x, h) {
+  forecast(nnetar(x, p=5, P=1), h=h)
+}
+mean(na.omit(tsCV(cases/1e5, nnet.cv, h = 8)))**0.5
+```
+
+The neural net performs worse than the rest, which might have been expected - it results in an over-fit. In reality, it may still be a correct model if the number of new cases drastically decreases as herd immunity rises.
+
+## Final forecasts
+
+Before we give the final forecasts, lets look at the residuals on the `ets()` model.
+
+```{r}
+checkresiduals(ets.fit, lag = 12)
+```
+
+Unfortunately our model passes the Ljung-Box test which means we are not left with just white noise.
+
+Lets try using the BoxCox transform from before.
+
+```{r}
+ets.fit.bx <- ets(cases/1e5, lambda = BoxCox.lambda(cases/1e5))
+checkresiduals(ets.fit.bx)
+```
+
+We don't have much of a difference as expected. This time I will try a fit by ignoring the first couple of months where the cases are under 100.
+
+```{r}
+ets.fit.bx.2 <- ets(window(cases/1e5, start = c(2020, 9)), 
+                  lambda = BoxCox.lambda(window(cases/1e5, start = c(2020, 9))))
+checkresiduals(ets.fit.bx.2)
+```
+
+Unfortunately we cannot get white noise residuals with this model. For lack of a better way to achieve this, we will go forward with the BoxCox outlier removed model for our forecasts.
+
+```{r}
+forecast(ets.fit.bx.2, h = 8)
+```
+
+For the next eight weeks, we can expect the number of new COVID cases to decrease steadily.
+
+```{r}
+autoplot(forecast(ets.fit.bx.2, h = 8))
+```
+
+
+
+
